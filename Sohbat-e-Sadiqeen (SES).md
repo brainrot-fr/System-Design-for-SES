@@ -17,7 +17,7 @@ MoSCoW (Must/Should/Could/Wont):
 **Must**:
 1. Must show nearby happening/upcoming events.
 2. Must show brothers of similar age/interests nearby if the user is male, nearby sisters if female.
-3. Must give bahr-e-aam/urs updates as per their Murshid, upcoming event updates via [[feat-notifs]] only (for now) and other major deeni updates like remaining days for Ramadan.
+3. Must give bahr-e-aam/urs updates as per their [[feat-murshidObject]], upcoming event updates via [[feat-notifs]] only (for now) and other major deeni updates like remaining days for Ramadan via [[feat-notifs]] as well.
 4. Must have [[feat-quran]], Hadees-e-RasoolAllah (SAWS) [[feat-hadees]] and Nuqool-e-Khalifatullah Imam Mahdi (AS) [[feat-nuqool]].
 5. Must have Multilingual Support.
 
