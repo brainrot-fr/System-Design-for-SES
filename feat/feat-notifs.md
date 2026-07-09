@@ -1,190 +1,272 @@
-There are two types of notifications:
-### Bahr-e-aam/urs notifications:
-- This is user specific notifications, each user have different Murshid, so this is Murshid-based.
-- scheduled via push notifications
+# Notifications
 
+## The short version
 
-### Daily ayahs, hadees and naql notifs:
-- similar to daily quotes
-- full working below.
+Two independent notification systems live under this one feature, because they behave completely differently:
 
-1. Summary
+1. **Daily wisdom** — one Ayah, one Hadees, one Naql, picked at random once a day, plus a fixed Ayah at 11 AM that never changes. Same content, sent to every user, at the same clock time, every day.
+2. **Prayer reminders** — Fajr, Dhuhr, Asr, Maghrib, Isha. These can't use a fixed clock time at all — they follow the sun, and the sun doesn't run on a schedule. Every user gets these at the _correct_ time for wherever they actually are.
 
-The app ships a bundled set of `{ key, body }` content pairs. At fixed times every day, the user should receive a push notification showing one randomly-picked pair as `title` / `body`. This must work without the app ever being reopened, and without any client-side background service.
+Both are delivered the same way underneath: a Postgres cron job wakes up, an Edge Function decides what to send, and Firebase Cloud Messaging pushes it to the phone — even if the app hasn't been opened in weeks. There's no client-side scheduling anywhere in this design. The app's only job is to hand over a device token once, then wait.
 
-Random selection and delivery are pushed entirely server-side. The client's only responsibility is registering a device token once.
+---
 
- 2. Goals / Non-Goals
+## Part 1 — Daily Wisdom (Ayah, Hadees, Naql)
 
-**Goals**
+### What the user sees
 
-- Deliver N notifications/day at fixed times, content picked randomly server-side, no caps on how far out delivery can be scheduled.
-- Zero reliance on the app being opened, backgrounded-refreshed, or running any local scheduling logic.
-- Same random Naql
-- $0 infrastructure cost, no billing account / credit card requirement.
+|Time (IST)|Notification|Rotates daily?|
+|---|---|---|
+|5:00 AM|Ayah of the Day|Yes — random pick|
+|7:00 AM|Hadees of the Day|Yes — random pick|
+|9:00 AM|Naql of the Day|Yes — random pick|
+|11:00 AM|A fixed Ayah|No — same one, every day, forever|
 
-**Non-Goals**
+That's 4 pushes a day, sent to _everyone_ — no per-user personalization, and no prayer-time coupling. An earlier version of this design tied the 5 AM Ayah to Fajr and the 5 PM Hadees to Asr; we deliberately pulled those apart. Fajr's time is about to become something that moves every day (see Part 2), and there's no reason a Quran verse should have to move with it.
 
-- No local notification scheduling, no `@capacitor/local-notifications`, no `@capacitor/background-runner`. (Superseded — see [Alternatives considered](#10-alternatives-considered).)
-- No per-user personalization of content (single shared pool for now).
-- No in-app notification inbox / read-state tracking.
+### The idea: pick once, read many times
 
- 3. Architecture Overview
+The old approach picked a random row from the whole corpus _at the moment each notification fired_. That works, but "no repeats this week" or "make today's three picks feel connected" would each need to be solved separately, at every send site.
 
-```
-┌─────────────┐   register token    ┌──────────────────────┐
-│ Capacitor   │ ───────────────────▶│ Edge Fn: register-    │
-│ app         │                     │ token                 │
-│             │                     └──────────┬────────────┘
-│ (FCM token  │                                │ upsert
-│  via        │                                ▼
-│  @capacitor-│                     ┌──────────────────────┐
-│  firebase/  │                     │ Postgres              │
-│  messaging) │                     │  - device_tokens       │
-└─────────────┘                     │  - notification_pool   │
-      ▲                             └──────────┬────────────┘
-      │ push delivered                          │ read
-      │ (APNs / FCM channel)                     ▼
-      │                             ┌──────────────────────┐
-      └─────────────────────────────│ Edge Fn: send-push     │
-                                     │  1. pick random pair   │
-                                     │  2. mint FCM OAuth tok │
-                                     │  3. POST per token     │
-                                     │  4. purge dead tokens  │
-                                     └──────────┬────────────┘
-                                                │ invoked by
-                                                ▼
-                                     ┌──────────────────────┐
-                                     │ pg_cron + pg_net       │
-                                     │ (fires at configured   │
-                                     │  UTC times daily)      │
-                                     └──────────────────────┘
-```
+Instead: once a day, a cron job reaches into the full corpus, makes exactly one pick per type, and writes it down. Every notification that day just _reads what was already decided_ — nothing at send time does any picking. Any smarter logic later (avoid repeats, weight by length, whatever) only has to be written in one place.
 
-Firebase's only role in this system is FCM delivery. No Cloud Functions, no Blaze plan, no billing account.
+### The trap: UTC midnight is not our midnight
 
- 4. Components
+This is the one part of this system that will quietly break if it isn't built exactly like this.
 
- 4.1 Client
+Postgres, by default, thinks in UTC. But **IST is UTC + 5:30** — and that offset is the trap: UTC's midnight lands at 5:30 AM IST, right in the middle of our morning notifications, between the 5 AM and 7 AM sends. If the daily pick is keyed off the database's default idea of "today," the 5 AM send and the 7 AM send could each see a _different_ "today" — and one of them finds nothing waiting for it.
 
-- Plugin: `@capacitor-firebase/messaging` (unified FCM token on both iOS and Android — the plain `@capacitor/push-notifications` plugin returns a raw APNs token on iOS that FCM can't target directly).
-- Responsibility: request permission, fetch token, POST it to `register-token` once on launch and again on `tokenReceived`.
-- Content pool JSX → plain text conversion happens upstream of this system (existing helper functions) — `notification_pool` only ever stores plain strings.
-
- 4.2 Firebase project (FCM delivery only)
-
-- Spark (free) plan — sufficient, since Cloud Functions are never used here.
-- Android app registered → `google-services.json`.
-- iOS app registered → `GoogleService-Info.plist` + APNs `.p8` Auth Key uploaded under Cloud Messaging.
-- Service account JSON (Project Settings → Service Accounts → Generate key) is the credential `send-push` uses to authenticate to FCM — stored as a Supabase secret, never shipped to the client.
-
-4.3 Supabase Postgres — data layer
-
-Two tables, both accessed only via `service_role` from within Edge Functions (never exposed to the client directly).
-
- 4.4 Supabase Edge Functions
-
-- `register-token` — public-ish write endpoint, upserts a device token.
-- `send-push` — the actual worker. Not invoked by the client at all; only by pg_cron.
-
- 4.5 pg_cron + pg_net
-
-- `pg_cron`: Postgres extension, enabled by default on Supabase, runs SQL on a schedule.
-- `pg_net`: lets that scheduled SQL fire an async HTTP call — this is what actually triggers `send-push`.
-- Runs in UTC; see [§8](#8-scheduling-configuration) for local-time conversion.
-
- 5. Data Model
+The fix: never let the database's default clock decide the date. Always ask explicitly for the IST date:
 
 ```sql
-create table device_tokens (
-  token         text primary key,
-  platform      text,                 -- 'ios' | 'android'
-  last_seen_at  timestamptz default now()
-);
+(now() at time zone 'Asia/Kolkata')::date
+```
 
-create table notification_pool (
+Everything below uses this — the picker writes with it, the sender reads with it.
+
+### Data model
+
+Two tables, doing two very different jobs:
+
+```sql
+-- The full corpus. Every Ayah/Hadees/Naql lives here, mirrored into
+-- Postgres purely so a server-side job can pick from it — the in-app
+-- reading experience still uses its own locally bundled copy.
+create type notif_type as enum ('ayah', 'hadees', 'naql');
+
+create table notification_content (
   id    uuid primary key default gen_random_uuid(),
-  key   text not null,                -- notification title
-  body  text not null                 -- notification body, plain text
+  type  notif_type not null,
+  title text not null,
+  body  text not null,
+  ref   text  -- optional, e.g. "51:56" or a hadees number — your own bookkeeping, never shown to the user
+);
+
+-- Today's pick. One row per day, wide on purpose: a "day" is naturally
+-- one row with three columns, not three rows that need joining.
+create table daily_content (
+  date         date primary key,  -- always the IST date, see above
+  ayah_title   text not null,
+  ayah_body    text not null,
+  hadees_title text not null,
+  hadees_body  text not null,
+  naql_title   text not null,
+  naql_body    text not null
+);
+
+-- The 11 AM Ayah. Its own tiny table instead of a hardcoded string in
+-- code, so it can be changed later without a redeploy — but it's one
+-- row, and it never rotates.
+create table fixed_content (
+  slot  text primary key,  -- 'ayah_11am'
+  title text not null,
+  body  text not null
 );
 ```
 
-No table for "sent history" in v1 — not needed since content isn't sequential or user-specific. Add one later if analytics/dedup-across-days becomes a requirement.
+### The jobs
 
- 6. Request Flows
+**Job 1 — pick today's content**, once a day, well before the first send:
 
- 6.1 Token registration
-
-```mermaid
-sequenceDiagram
-    participant App
-    participant register-token
-    participant Postgres
-
-    App->>App: FirebaseMessaging.requestPermissions()
-    App->>App: FirebaseMessaging.getToken()
-    App->>register-token: POST { token, platform }
-    register-token->>Postgres: upsert into device_tokens
-    register-token-->>App: 200 ok
+```sql
+select cron.schedule(
+  'pick-daily-content',
+  '0 21 * * *',  -- 21:00 UTC = 2:30 AM IST — safely before the 5 AM send
+  $$
+  insert into daily_content (date, ayah_title, ayah_body, hadees_title, hadees_body, naql_title, naql_body)
+  select
+    (now() at time zone 'Asia/Kolkata')::date,
+    a.title, a.body, h.title, h.body, n.title, n.body
+  from
+    (select title, body from notification_content where type = 'ayah'   order by random() limit 1) a,
+    (select title, body from notification_content where type = 'hadees' order by random() limit 1) h,
+    (select title, body from notification_content where type = 'naql'   order by random() limit 1) n
+  on conflict (date) do nothing;
+  $$
+);
 ```
 
-```ts
-// supabase/functions/register-token/index.ts
-import { createClient } from 'npm:@supabase/supabase-js@2';
+**Job 2 — send**, one job per time slot, all pointing at the same Edge Function with a different `slot` in the request body:
 
+|IST time|UTC cron|Cron expression|slot|
+|---|---|---|---|
+|5:00 AM|23:30 (prev. day)|`30 23 * * *`|`ayah`|
+|7:00 AM|01:30|`30 1 * * *`|`hadees`|
+|9:00 AM|03:30|`30 3 * * *`|`naql`|
+|11:00 AM|05:30|`30 5 * * *`|`ayah_11am`|
+
+```js
+// supabase/functions/send-content/index.js
 Deno.serve(async (req) => {
-  const { token, platform } = await req.json();
-  const supabase = createClient(
-    Deno.env.get('SUPABASE_URL')!,
-    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
-  );
-  await supabase.from('device_tokens').upsert(
-    { token, platform, last_seen_at: new Date().toISOString() },
-    { onConflict: 'token' }
-  );
+  const { slot } = await req.json();
+  const supabase = adminClient();
+  const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
+
+  let title, body;
+
+  if (slot === 'ayah_11am') {
+    const { data } = await supabase.from('fixed_content').select('title, body').eq('slot', slot).single();
+    ({ title, body } = data);
+  } else {
+    const { data } = await supabase.from('daily_content').select('*').eq('date', today).single();
+    title = data[`${slot}_title`];
+    body  = data[`${slot}_body`];
+  }
+
+  await sendToAllTokens(supabase, title, body); // shared helper, see "Shared plumbing" below
   return new Response('ok');
 });
 ```
 
-Client call site:
+No `order by random()` anywhere near send time anymore — just a lookup.
 
-```ts
-await fetch('https://<project-ref>.supabase.co/functions/v1/register-token', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ token, platform: Capacitor.getPlatform() }),
+---
+
+## Part 2 — Prayer Time Reminders
+
+### What the user sees
+
+Fajr, Dhuhr, Asr, Maghrib, Isha — one push each, at the moment that prayer actually begins, wherever that user happens to be.
+
+### Why this can't be a fixed clock time
+
+Every one of these five moments is defined by where the sun is, not by a clock: Fajr by first light, Dhuhr by the sun crossing its highest point, Asr by a shadow reaching a certain length, Maghrib by sunset, Isha by full dark. None of that holds still — it shifts a little every day and swings by well over an hour across the year. Hardcoding "Fajr = 5:00 AM" would be right for a few weeks and quietly wrong the rest of the year.
+
+The fix: don't compute this once and forget it — recompute it daily, for wherever the user actually is.
+
+### How it works, step by step
+
+1. Once a day, for every region that has at least one user in it, ask a prayer-times service for tomorrow's five times.
+2. Store those as plain, absolute timestamps — no timezone math needed at read time, no cron expression to maintain per region.
+3. A small job wakes up every 10 minutes, checks "is anything due right now," and if so, sends only to the users in that region.
+
+Checking on some interval is unavoidable — there's no built-in way to ask Postgres to fire at one exact arbitrary instant without building a small job-queue system on top of pg_cron, which is more moving parts than this needs. So the real question is just how coarse that interval can be. 10 minutes means a prayer notification is never more than 10 minutes late, and costs about 144 Edge Function invocations a day — a rounding error against Supabase's free-tier allowance no matter what interval is picked. Going to hourly instead is a one-line change (`'0 * * * *'`) if fewer jobs matters more than timeliness — but it means a notification could land up to 59 minutes after the prayer actually started.
+
+This deliberately avoids one cron job per region per prayer — that turns into a growing pile of scheduled jobs to manage (and clean up) as new cities join. A fixed pair of jobs that scales through table rows instead of more cron jobs stays maintainable no matter how many regions get added later.
+
+### Data model
+
+```sql
+-- Shared with the nearby-events/nearby-people feature — one canonical
+-- "where is this user" concept, reused here instead of solved twice.
+create table regions (
+  id      uuid primary key default gen_random_uuid(),
+  city    text not null,
+  country text not null,
+  lat     double precision not null,
+  lng     double precision not null,
+  unique (city, country)
+);
+
+alter table profiles add column region_id uuid references regions(id);
+
+-- Rewritten daily. One row per prayer per region, always for "today."
+create table region_prayer_times (
+  region_id uuid references regions(id),
+  prayer    text not null,        -- fajr | dhuhr | asr | maghrib | isha
+  fires_at  timestamptz not null, -- absolute instant — nothing to convert when reading this
+  primary key (region_id, prayer)
+);
+```
+
+**One change this forces on the existing schema:** `device_tokens` used to be an anonymous list — fine when every push went to everyone. Now that prayer pushes are region-specific, a token has to be traceable back to a user, and from there to a region:
+
+```sql
+alter table device_tokens add column user_id uuid not null references auth.users(id);
+```
+
+### The jobs
+
+**Job 1 — compute tomorrow's times**, once a day, comfortably before the earliest Fajr anywhere this applies:
+
+```sql
+select cron.schedule(
+  'compute-region-times',
+  '0 12 * * *',  -- 12:00 UTC = 5:30 PM IST — a full overnight buffer before the next Fajr
+  $$ select net.http_post(url := '.../functions/v1/compute-region-times') $$
+);
+```
+
+```js
+// For every active region, ask Aladhan for today's timings and store
+// them as absolute instants. School defaults to Hanafi (school=1) —
+// confirm that's right for the community rather than leaving it
+// unset, since it changes the Asr calculation specifically.
+for (const region of activeRegions) {
+  const res = await fetch(
+    `https://api.aladhan.com/v1/timingsByCity?city=${region.city}&country=${region.country}&method=1&school=1`
+  );
+  const timings = (await res.json()).data.timings;
+  for (const prayer of ['Fajr', 'Dhuhr', 'Asr', 'Maghrib', 'Isha']) {
+    await supabase.from('region_prayer_times').upsert({
+      region_id: region.id,
+      prayer: prayer.toLowerCase(),
+      fires_at: toUtcTimestamp(timings[prayer], region), // combine today's date + the returned HH:mm
+    });
+  }
+}
+```
+
+**Job 2 — the ticker**, checking every 10 minutes for anything due:
+
+```sql
+select cron.schedule(
+  'dispatch-prayer',
+  '*/10 * * * *',
+  $$ select net.http_post(url := '.../functions/v1/dispatch-prayer') $$
+);
+```
+
+```js
+// supabase/functions/dispatch-prayer/index.js
+Deno.serve(async () => {
+  const supabase = adminClient();
+  const { data: due } = await supabase
+    .from('region_prayer_times')
+    .select('region_id, prayer')
+    .gte('fires_at', new Date().toISOString())
+    .lt('fires_at', new Date(Date.now() + 10 * 60_000).toISOString());
+
+  for (const { region_id, prayer } of due ?? []) {
+    const tokens = await tokensForRegion(supabase, region_id); // one join: device_tokens → profiles → region_id
+    await sendToTokens(tokens, `Time for ${capitalize(prayer)}`, '');
+  }
+  return new Response('ok');
 });
 ```
 
- 6.2 Scheduled send
+---
 
-```mermaid
-sequenceDiagram
-    participant pg_cron
-    participant send-push
-    participant Postgres
-    participant Google OAuth
-    participant FCM
+## Shared plumbing (both parts use this)
 
-    pg_cron->>send-push: net.http_post (at configured UTC time)
-    send-push->>Postgres: select random row from notification_pool
-    send-push->>Postgres: select all device_tokens
-    send-push->>Google OAuth: exchange signed JWT for access_token
-    Google OAuth-->>send-push: access_token
-    loop each token
-        send-push->>FCM: POST messages:send
-        FCM-->>send-push: 200 / error (e.g. UNREGISTERED)
-    end
-    send-push->>Postgres: delete dead tokens
-```
+Both subsystems end at the same place: hand a title, a body, and a list of tokens to Firebase.
 
-```ts
-// supabase/functions/send-push/index.ts
-import { createClient } from 'npm:@supabase/supabase-js@2';
+FCM's v1 API needs an OAuth token minted from a service-account key — there's no static "server key" anymore. This OAuth step is between our backend and Google only; it has nothing to do with how users log into SES via Supabase Auth. `firebase-admin` isn't used here on purpose: its internals depend on Node APIs that don't exist in the Deno runtime Edge Functions run on. Instead, the JWT is built and signed by hand with the Web Crypto API (`crypto.subtle`), then traded for an access token at Google's OAuth endpoint. Zero extra dependencies.
 
-const SA = JSON.parse(Deno.env.get('FIREBASE_SERVICE_ACCOUNT')!);
-
-function b64url(input: ArrayBuffer | string) {
+```js
+// getAccessToken() is the actual "prove we're allowed to call FCM" step —
+// SA is the Firebase service-account JSON, loaded once from a Supabase secret.
+function b64url(input) {
   const bytes = typeof input === 'string' ? new TextEncoder().encode(input) : new Uint8Array(input);
   return btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
@@ -208,26 +290,22 @@ async function getAccessToken() {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${unsigned}.${b64url(sig)}`,
   });
-  return (await res.json()).access_token as string;
+  return (await res.json()).access_token;
 }
 
-Deno.serve(async () => {
-  const supabase = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
-  const { data: pool } = await supabase.from('notification_pool').select('key, body');
-  const { data: tokens } = await supabase.from('device_tokens').select('token');
-  if (!pool?.length || !tokens?.length) return new Response('nothing to send');
+async function sendToAllTokens(supabase, title, body) {
+  const { data } = await supabase.from('device_tokens').select('token');
+  return sendToTokens(data.map(t => t.token), title, body);
+}
 
-  const pick = pool[Math.floor(Math.random() * pool.length)];
+async function sendToTokens(tokens, title, body) {
   const accessToken = await getAccessToken();
-  const dead: string[] = [];
-
-  for (const { token } of tokens) {
-    const res = await fetch(`https://fcm.googleapis.com/v1/projects/${SA.project_id}/messages:send`, {
+  const dead = [];
+  for (const token of tokens) {
+    const res = await fetch(`https://fcm.googleapis.com/v1/projects/${PROJECT_ID}/messages:send`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        message: { token, notification: { title: pick.key, body: pick.body }, data: { key: pick.key } },
-      }),
+      body: JSON.stringify({ message: { token, notification: { title, body } } }),
     });
     if (!res.ok) {
       const err = await res.json().catch(() => null);
@@ -235,117 +313,31 @@ Deno.serve(async () => {
     }
   }
   if (dead.length) await supabase.from('device_tokens').delete().in('token', dead);
-  return new Response('ok');
+}
+```
+
+**Registering a token** hasn't changed shape, it just gained a `user_id`:
+
+```ts
+await fetch('https://<project-ref>.supabase.co/functions/v1/register-token', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ token, platform: Capacitor.getPlatform(), user_id: currentUser.id }),
 });
 ```
 
-Deploy:
+---
 
-```bash
-supabase secrets set FIREBASE_SERVICE_ACCOUNT="$(cat service-account.json)"
-supabase functions deploy register-token --no-verify-jwt
-supabase functions deploy send-push
-```
+## Cost
 
-7. FCM Authentication
+Still $0. Everything here runs on Supabase's free tier (Postgres + pg_cron + pg_net + Edge Functions) and Firebase's free Spark plan (FCM delivery only — no Cloud Functions, no Blaze plan, no card on file). The prayer-time ticker adds roughly 144 extra Edge Function invocations a day on top of the content sends — a few percent of the free tier's monthly allowance even before accounting for the content sends. Worth a glance at Supabase's current numbers before launch since they do get revised, but invocation count isn't the constraint here at any reasonable ticker interval.
 
-FCM's v1 API requires an OAuth2 access token minted from the service account — there is no static server key anymore. `firebase-admin` is deliberately **not** used here: its auth internals depend on Node built-ins (`child_process`, etc.) that don't exist in the Deno runtime Edge Functions run on, and fail at deploy time. Instead, `getAccessToken()` builds and RS256-signs the JWT by hand using the Web Crypto API (`crypto.subtle`), then trades it for an access token at Google's token endpoint. Zero external dependencies.
+## Part 3 — Bahr-e-aam / Urs updates (not designed yet)
 
-8. Scheduling Configuration
+Per-Murshid updates — each user follows a different Murshid (see feat-murshidObject), so this is closer in shape to Part 2 (per-user, not "same for everyone") than Part 1. Deliberately not designed in this pass; noting it here so the doc doesn't quietly lose track of it. Whatever shape it takes, it plugs into the same shared plumbing above (`sendToTokens`, the token-registration flow) rather than needing its own delivery mechanism.
 
-`pg_cron` runs in UTC. Convert each desired IST send time (UTC+5:30) before scheduling:
+## Open questions
 
-|Desired time (IST)|Cron UTC time|Cron expression|
-|---|---|---|
-|09:00|03:30|`30 3 * * *`|
-|20:00|14:30|`30 14 * * *`|
-
-Secrets (function URL, service-role key) are kept in Supabase Vault rather than pasted into the schedule body, since `cron.job` / `cron.job_run_details` are otherwise plaintext-visible:
-
-```sql
-select vault.create_secret('https://<project-ref>.supabase.co/functions/v1/send-push', 'push_url');
-select vault.create_secret('<service-role-key>', 'push_auth');
-
-select cron.schedule(
-  'push-morning',
-  '30 3 * * *',
-  $$
-  select net.http_post(
-    url := (select decrypted_secret from vault.decrypted_secrets where name = 'push_url'),
-    headers := jsonb_build_object(
-      'Authorization', 'Bearer ' || (select decrypted_secret from vault.decrypted_secrets where name = 'push_auth'),
-      'Content-Type', 'application/json'
-    )
-  );
-  $$
-);
-
-select cron.schedule(
-  'push-evening',
-  '30 14 * * *',
-  $$
-  select net.http_post(
-    url := (select decrypted_secret from vault.decrypted_secrets where name = 'push_url'),
-    headers := jsonb_build_object(
-      'Authorization', 'Bearer ' || (select decrypted_secret from vault.decrypted_secrets where name = 'push_auth'),
-      'Content-Type', 'application/json'
-    )
-  );
-  $$
-);
-```
-
-9. Failure Handling
-
-|Failure|Handling|
-|---|---|
-|FCM returns `UNREGISTERED` / 404 for a token|Token added to `dead` list, deleted from `device_tokens` at end of run|
-|`pg_net` call fails (5xx, timeout)|Fire-and-forget — no automatic retry. Visible in `net._http_response`. Acceptable at this scale; add a retry job later if needed.|
-|Service account `project_id` mismatch|Silent iOS-only failure (APNs key uploaded to wrong Firebase project). No automated detection — verify manually during setup.|
-|`notification_pool` or `device_tokens` empty|`send-push` short-circuits and returns early, no-op.|
-
-10. Observability
-
-```sql
--- did the cron job fire, and what happened
-select * from cron.job_run_details order by start_time desc limit 5;
-
--- what did the HTTP call to send-push actually return
-select * from net._http_response order by created desc limit 5;
-```
-
-Manual invoke, bypassing cron entirely, for testing:
-
-```bash
-supabase functions invoke send-push
-```
-
-11. Setup Checklist
-
-- [ ] Firebase project created, Android + iOS apps registered
-- [ ] APNs `.p8` key uploaded to Firebase Cloud Messaging settings
-- [ ] Service account JSON downloaded
-- [ ] `@capacitor-firebase/messaging` installed, client registration wired up
-- [ ] `notification_pool` seeded with initial content
-- [ ] `register-token` and `send-push` deployed
-- [ ] `FIREBASE_SERVICE_ACCOUNT` secret set
-- [ ] Vault secrets created (`push_url`, `push_auth`)
-- [ ] `cron.schedule` jobs created for each daily time
-- [ ] End-to-end test via `supabase functions invoke send-push` on a real device
-
-12. Cost
-
-$0 at this scale. No billing account required anywhere in this stack — Supabase free tier covers Edge Functions + pg_cron, FCM is free on Firebase's Spark plan. Contrast with the Firebase Cloud Functions alternative, which forces the Blaze (pay-as-you-go) plan and a card on file even though usage-based cost stays at $0.
-
- 13. Alternatives Considered
-
-- **Local notifications, batch-scheduled + `@capacitor/background-runner` top-up** — fully on-device, no backend at all. Rejected in favor of this design for cleanliness: iOS caps pending local notifications at 64, requiring batch-refill logic, and `BGTaskScheduler` execution is opportunistic (not guaranteed timing). This push-based design has no such cap and no dependency on the app ever being opened.
-- **Firebase Cloud Functions (`onSchedule`) instead of Supabase** — functionally equivalent, simpler code (real `firebase-admin` SDK, no manual JWT signing) but requires the Blaze plan and a card on file. Rejected for this project given the $0 / no-billing-account constraint.
-- **True background service (Android foreground service / iOS background execution)** — not viable. iOS has no general-purpose "run continuously" mechanism for a non-exempt app category. Android's foreground service would work but requires a permanent visible notification and Play Store policy justification for a use case (`specialUse`) that doesn't clearly qualify.
-
-14. Open Questions / Future Work
-
-- Multi-timezone support if the user base isn't India-only (currently hardcoded UTC offsets in cron expressions).
-- Retry logic for failed `pg_net` calls.
-- Per-user content history to avoid repeats within N days.
-- Rich notification support (images) if the content pool grows to include them.
+- **Regions outside IST**: `compute-region-times`'s run-time and the content system's IST date-keying both assume one timezone for now. Needs a second look the day a region outside India shows up.
+- **Corpus quality**: a fully random pick from the whole Ayah/Hadees/Naql corpus can occasionally land on something long or awkward as a standalone notification. Not fixing this now — a future content-curation pass, not a schema change.
+- **Repeats**: nothing currently stops the same Ayah/Hadees/Naql from being picked again a few days later. Easy to add later (exclude anything shown in the last N days) — left out for now to keep the picker simple.
