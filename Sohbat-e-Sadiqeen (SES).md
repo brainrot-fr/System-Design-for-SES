@@ -25,8 +25,6 @@ MoSCoW (Must/Should/Could/Wont):
 1. For event organizers, should show willing volunteers (in the same region) for events.
 2. For volunteers, should show upcoming events (in the same region) to volunteer for.
 3. Should have a list of Ziyarahs.
-4. Should have [[feat-timeline-RasoolAllah-SAWS]].
-5. Should have [[feat-timeline-Imam-Mahdi-AS]].
 
 **Could:**
 1. Could have [[feat-silsila-e-tarbiyat]].
